@@ -1,0 +1,106 @@
+name: nix-quick-install-action-disk-diagnostic
+on: workflow_dispatch
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner baseline
+        run: |
+          echo "runner image: ${ImageOS:-unknown} / ${ImageVersion:-unknown}"
+          uname -a
+          df -h /
+          free -m
+          date -u +%FT%TZ
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v35
+
+      - name: Nix version and install mode
+        continue-on-error: true
+        run: |
+          echo "--- nix --version ---"
+          nix --version || true
+          echo "--- which nix ---"
+          command -v nix || true
+          readlink -f "$(command -v nix)" || true
+          echo "--- daemon ---"
+          systemctl is-active nix-daemon.service || true
+          systemctl is-active nix-daemon.socket || true
+          pgrep -a nix-daemon || echo "no nix-daemon process"
+          echo "--- store ownership ---"
+          ls -ld /nix /nix/store || true
+          echo "--- whoami / groups ---"
+          id || true
+          echo "--- nix.conf locations ---"
+          for f in /etc/nix/nix.conf "$HOME/.config/nix/nix.conf" "${XDG_CONFIG_HOME:-}/nix/nix.conf"; do
+            [ -f "$f" ] && { echo "== $f =="; cat "$f"; } || true
+          done
+
+      - name: Experimental features and channels
+        continue-on-error: true
+        run: |
+          echo "--- experimental-features ---"
+          nix config show experimental-features || nix show-config experimental-features || true
+          echo "--- nix flake --help (exit code only) ---"
+          nix flake --help >/dev/null 2>&1 && echo "flakes: OK" || echo "flakes: UNAVAILABLE"
+          echo "--- nix-channel --list ---"
+          nix-channel --list || echo "(no channels / command failed)"
+          sudo nix-channel --list 2>/dev/null || true
+          echo "--- NIX_PATH ---"
+          echo "NIX_PATH=${NIX_PATH:-<unset>}"
+          echo "--- nix registry list ---"
+          nix registry list 2>/dev/null | head -20 || true
+
+      - name: Store footprint after install
+        continue-on-error: true
+        run: |
+          echo "--- du -sb /nix ---"
+          sudo du -sb /nix || du -sb /nix || true
+          echo "--- du -sh /nix ---"
+          sudo du -sh /nix || du -sh /nix || true
+          echo "--- store path count ---"
+          ls /nix/store | wc -l || true
+          echo "--- df -h / ---"
+          df -h / || true
+
+      - name: Trivial evaluation
+        continue-on-error: true
+        run: |
+          nix-instantiate --eval -E '1 + 1' || echo "nix-instantiate FAILED"
+          nix eval --expr '1 + 1' --impure 2>/dev/null || echo "nix eval FAILED"
+
+      - name: First build hello from pinned nixpkgs
+        continue-on-error: true
+        run: |
+          nix-build --no-out-link \
+            -E 'with import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/ac62194c3917d5f474c1a844b6fd6da2db95077d.tar.gz") {}; hello' \
+            || echo "nix-build hello FAILED"
+
+      - name: Flake invocation nix run nixpkgs#hello
+        continue-on-error: true
+        run: |
+          nix run nixpkgs#hello 2>&1 | tail -5 || echo "nix run nixpkgs#hello FAILED"
+
+      - name: Final footprint
+        continue-on-error: true
+        run: |
+          sudo du -sb /nix || du -sb /nix || true
+          sudo du -sh /nix || du -sh /nix || true
+          ls /nix/store | wc -l || true
+          df -h / || true
+
+      - name: Disk breakdown
+        continue-on-error: true
+        run: |
+          echo "--- du -sh /nix/* ---"
+          sudo du -sh /nix/* 2>/dev/null | sort -h || true
+          echo "--- du -sh /nix/var/* ---"
+          sudo du -sh /nix/var/* 2>/dev/null | sort -h || true
+          echo "--- du -sb vs du -sB1 --apparent-size ---"
+          sudo du -sb /nix; sudo du -s --block-size=1 /nix
+          echo "--- nix store size via path-info ---"
+          nix path-info --all -S 2>/dev/null | awk '{s+=$2} END {print s" bytes in store paths"}' || true
+          echo "--- home caches ---"
+          du -sh "$HOME/.cache/nix" 2>/dev/null || echo "no ~/.cache/nix"
+          sudo du -sh /root/.cache/nix 2>/dev/null || echo "no /root/.cache/nix"
