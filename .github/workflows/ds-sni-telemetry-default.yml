@@ -1,0 +1,105 @@
+name: ds-sni-telemetry-default
+on: workflow_dispatch
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Runner baseline
+        run: |
+          echo "runner image: ${ImageOS:-unknown} / ${ImageVersion:-unknown}"
+          uname -a
+          date -u +%FT%TZ
+
+      - name: Blackhole telemetry hosts
+        run: |
+          echo "--- nsswitch before ---"
+          grep '^hosts:' /etc/nsswitch.conf || true
+          # systemd-resolved can sit ahead of `files`, in which case /etc/hosts is never consulted
+          sudo sed -i 's/^hosts:.*/hosts: files dns/' /etc/nsswitch.conf
+          echo "--- nsswitch after ---"
+          grep '^hosts:' /etc/nsswitch.conf
+          printf '\n' | sudo tee -a /etc/hosts >/dev/null
+          for h in install.determinate.systems otel.determinate.systems; do
+            printf '127.0.0.1 %s\n::1 %s\n' "$h" "$h" | sudo tee -a /etc/hosts >/dev/null
+          done
+          echo "--- resolution after blackhole ---"
+          getent hosts install.determinate.systems || echo "install.determinate.systems: no result"
+          getent hosts otel.determinate.systems    || echo "otel.determinate.systems: no result"
+          getent hosts cf.install.determinate.systems || echo "cf.install.determinate.systems: no result"
+          echo "--- assert the blackhole took effect ---"
+          for h in install.determinate.systems otel.determinate.systems; do
+            if getent hosts "$h" | grep -qvE '^(127\.0\.0\.1|::1) '; then
+              echo "BLACKHOLE FAILED for $h"; exit 1
+            fi
+            echo "$h is blackholed"
+          done
+          getent hosts cf.install.determinate.systems | grep -qvE '^(127\.0\.0\.1|::1) ' \
+            && echo "cf.install.determinate.systems still reachable, as intended" \
+
+      - name: Start SNI listener on the blackholed addresses
+        run: |
+          cat > /tmp/sni.js <<'JSEOF'
+          const net = require("net");
+          function parseSNI(buf) {
+            try {
+              if (buf[0] !== 0x16) return null;
+              let p = 5;
+              if (buf[p] !== 0x01) return null;
+              p += 4 + 2 + 32;
+              p += 1 + buf[p];
+              p += 2 + buf.readUInt16BE(p);
+              p += 1 + buf[p];
+              if (p + 2 > buf.length) return null;
+              const end = p + 2 + buf.readUInt16BE(p);
+              p += 2;
+              while (p + 4 <= end) {
+                const type = buf.readUInt16BE(p);
+                const len = buf.readUInt16BE(p + 2);
+                if (type === 0) {
+                  let q = p + 4 + 2 + 1;
+                  const n = buf.readUInt16BE(q);
+                  return buf.slice(q + 2, q + 2 + n).toString("utf8");
+                }
+                p += 4 + len;
+              }
+            } catch (e) {}
+            return null;
+          }
+          const onConn = (sock) => {
+            const t = setTimeout(() => sock.destroy(), 3000);
+            sock.once("data", (d) => {
+              clearTimeout(t);
+              console.log(`${new Date().toISOString()} CONNECT sni=${parseSNI(d) ?? "unknown"} bytes=${d.length}`);
+              sock.destroy();
+            });
+            sock.on("error", () => {});
+          };
+          for (const host of ["127.0.0.1", "::1"]) {
+            const s = net.createServer(onConn);
+            s.on("error", (e) => console.log(`listen error ${host}: ${e.message}`));
+            s.listen(443, host, () => console.log(`listening on ${host}:443`));
+          }
+          JSEOF
+          sudo nohup "$(command -v node)" /tmp/sni.js > /tmp/sni.log 2>&1 &
+          sleep 3
+          cat /tmp/sni.log
+
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - name: SNI listener report
+        continue-on-error: true
+        run: |
+          sleep 3
+          echo "--- connections seen on the blackholed addresses ---"
+          cat /tmp/sni.log || true
+          echo "--- distinct SNI names ---"
+          grep -oE 'sni=[^ ]+' /tmp/sni.log | sort | uniq -c || echo "none"
+          sudo pkill -f /tmp/sni.js || true
+
+      - name: Nix version and install mode
+        continue-on-error: true
+        run: |
+          nix --version || true
