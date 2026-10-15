@@ -104,3 +104,5 @@ jobs:
           echo "--- home caches ---"
           du -sh "$HOME/.cache/nix" 2>/dev/null || echo "no ~/.cache/nix"
           sudo du -sh /root/.cache/nix 2>/dev/null || echo "no /root/.cache/nix"
+          echo "--- 10 largest store entries ---"
+          sudo du -s --block-size=1M /nix/store/* 2>/dev/null | sort -n | tail -10 || true
